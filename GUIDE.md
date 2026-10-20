@@ -1,0 +1,600 @@
+# DDW — Detailed Guide
+
+Full workflow reference, architecture details, hook diagrams, and agent profiles.
+
+For a quick overview, see [README.md](README.md).
+
+---
+
+## How It Works
+
+```
+                          ┌─────────────────────────────────────────┐
+                          │           DDW Lifecycle                  │
+                          └─────────────────────────────────────────┘
+
+          ┌──────────┐        ┌────────────┐        ┌──────────┐
+          │  IDEATE   │───────>│  DECISION  │───────>│   TASK   │
+          │ (optional)│        │            │        │          │
+          └──────────┘        └────────────┘        └──────────┘
+           /ddw:ideate         /ddw:decision         /ddw:task
+           Shaper agent        Architect agent        ─ scope
+           ─ shape idea        ─ system design        ─ acceptance
+           ─ produce PRD       ─ constraints          ─ criteria
+                               ─ task breakdown       ─ dependencies
+                               ─ risk assessment
+                                      │
+                          Status: proposed → decided
+                                      │
+                          ┌───────────┘
+                          │  (all tasks created — hook enforced)
+                          ▼
+                    ┌──────────┐
+                    │  SENDIT  │
+                    │          │
+                    └──────────┘
+                     /ddw:sendit
+                     Developer agent
+                     ─ create feature branch
+                     ─ implement spec-first
+                     ─ minimal blast radius
+                     ─ write unit + integration tests
+                            │
+                   Status: planned → in_progress
+                            │
+                            ▼
+                    ┌──────────┐
+                    │  TESTS   │
+                    │          │
+                    └──────────┘
+                     ─ unit tests for functions
+                     ─ integration tests for features
+                     ─ all tests must pass
+                            │
+                            ▼
+                    ┌──────────┐        ┌──────────────────┐
+                    │    QA    │──BLOCKED──> Fix & re-run   │
+                    │          │        └──────────────────┘
+                    └──────────┘                │
+                     /ddw:qa                    │
+                     QA agent                   │
+                     ─ score acceptance criteria │
+                     ─ invariant regression sweep
+                     ─ verdict: CLEAR or BLOCKED
+                            │
+                          CLEAR
+                            │
+                            ▼
+                    ┌──────────┐
+                    │  REVIEW  │
+                    │          │
+                    └──────────┘
+                     /ddw:review
+                     ─ run QA (if not done)
+                     ─ run tests
+                     ─ owner review checklist
+                            │
+                   Status: → review_and_bugfix
+                            │
+                     Owner verifies ✓
+                            │
+                   Status: → done
+                            │
+                            ▼
+                    ┌──────────┐
+                    │  CLOSE   │
+                    │          │
+                    └──────────┘
+                     /ddw:close
+                     ─ rebase task branch onto base
+                     ─ re-run tests in worktree
+                     ─ merge --no-ff into base (local mode)
+                       or print push + gh pr create (pr mode)
+                     ─ update CURRENT_SPEC (opt-in)
+                     ─ run drift detection
+                     ─ retrospective (auto-skipped on clean+short+single-session)
+                     ─ archive task / auto-close DEC if last task
+                     ─ remove task worktree
+                     ─ ddw-index regenerates 4 log views
+```
+
+**PRD lifecycle (parallel track):** `/ddw:ideate` creates a PRD → `/ddw:decision` references it and appends DEC IDs to the PRD's `Decisions:` array → owner runs `/ddw:prd close PRD-id` once all relevant DECs exist (sets `Status: closed`, moves to `prds/archive/`).
+
+## Status State Machine
+
+```
+  PRD:       draft ──→ solid ──→ closed ──→ (archived)
+               │           │
+               └──→ parked │
+                           └──→ /ddw:decision links a DEC
+                                /ddw:prd close marks closed
+
+  Decision:  proposed ──→ decided ──→ in_progress ──→ closed ──→ (archived)
+                  │           │            (auto-flips when      │
+                  │           │             first task created)  │
+                  │           └──→ cancelled / parked            │
+                  └──→ rejected                                  │
+                                                                 │
+                                              (auto-closes when last
+                                               linked task closes)
+
+  Task:      planned ──→ in_progress ──→ review_and_bugfix ──→ done ──→ closed ──→ (archived)
+                  │            │                  │              │
+                  │            │           QA CLEAR + owner    /ddw:close
+                  │            │           verifies            rebases + merges (local)
+                  │            │                               or prints push + gh pr create (pr)
+                  │            │
+                  └──→ abandoned (via /ddw:close --abandon)
+```
+
+Every frontmatter field has exactly one writer — task author for goals/scope, skills for status transitions and timestamps, agents for review log entries. The pattern: human declares intent, skills enforce flow, agents append findings.
+
+## Enforcement Layer
+
+DDW has two layers of enforcement:
+
+```
+  ┌─────────────────────────────────────────────────────┐
+  │  SOFT ENFORCEMENT (instructions)                     │
+  │  CLAUDE.md tells Claude: "follow the workflow"       │
+  │  ─ Can be persuaded with enough effort               │
+  ├─────────────────────────────────────────────────────┤
+  │  HARD ENFORCEMENT (hooks)                            │
+  │  Shell scripts that exit 2 → write blocked           │
+  │  ─ Cannot be bypassed through conversation           │
+  │  ─ No amount of prompt engineering changes this      │
+  └─────────────────────────────────────────────────────┘
+```
+
+### Hook Flow Diagram
+
+```
+  User/Claude attempts a Write or Edit
+           │
+           ▼
+  ┌─ PreToolUse ─────────────────────────────────────┐
+  │                                                    │
+  │  validate-datetime ──── placeholder? ── exit 2 ──> BLOCKED
+  │         │ ok                                       │
+  │  require-active-task ── no task? ───── exit 2 ──> BLOCKED
+  │         │ ok                                       │
+  │  require-all-tasks ──── missing? ───── exit 2 ──> BLOCKED
+  │         │ ok                                       │
+  │  check-deps-done ────── deps not done? exit 2 ──> BLOCKED
+  │         │ ok                                       │
+  │  require-review ──────── no review? ── exit 2 ──> BLOCKED
+  │         │ ok                                       │
+  └─────────┼──────────────────────────────────────────┘
+            │
+            ▼
+       Write/Edit executes
+            │
+            ▼
+  ┌─ PostToolUse ────────────────────────────────────┐
+  │                                                    │
+  │  check-task-complete ── all AC done? ── prompt close
+  │  create-decided-tasks ─ decided? ────── prompt tasks
+  │                                                    │
+  └────────────────────────────────────────────────────┘
+```
+
+## Agent Profiles
+
+Five role-separated mindsets. Each is loaded at the right phase — they define **how to think**, not what to check. (The fifth, Security, is shown in the Adversarial Security Audit section below — not in this diagram because it runs standalone, not inline with the lifecycle.)
+
+```
+  ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
+  │   SHAPER   │   │  ARCHITECT │   │  DEVELOPER │   │     QA     │
+  │            │   │            │   │            │   │            │
+  │ Thinking   │   │ System     │   │ Spec-first │   │ Adversarial│
+  │ partner    │   │ designer   │   │ implementer│   │ evaluator  │
+  │            │   │            │   │            │   │            │
+  │ Draws out  │   │ Reads      │   │ Reads task │   │ Does NOT   │
+  │ ideas      │   │ broadly:   │   │ guardrails │   │ read dev's │
+  │ Identifies │   │ codebase,  │   │ invariants │   │ Context    │
+  │ gaps       │   │ decisions, │   │ spec       │   │ Packing or │
+  │ No jargon  │   │ retro log, │   │            │   │ Impl       │
+  │            │   │ spec       │   │ Minimal    │   │ Summary    │
+  │            │   │            │   │ blast      │   │            │
+  │ /ideate    │   │ /decision  │   │ radius     │   │ Judges     │
+  │            │   │ /architect │   │            │   │ code vs    │
+  │            │   │            │   │ /sendit    │   │ spec only  │
+  │            │   │            │   │            │   │            │
+  │            │   │            │   │            │   │ /qa        │
+  │            │   │            │   │            │   │ /review    │
+  └────────────┘   └────────────┘   └────────────┘   └────────────┘
+```
+
+**Key design: information separation.** QA never reads the developer's justifications — it judges the code against the spec independently. This prevents confirmation bias.
+
+## Automated QA
+
+Two-pass evaluation runs before every review:
+
+```
+  /ddw:qa
+     │
+     ├── Pass 1: Acceptance Criteria
+     │      │
+     │      ├── code-grep ──── grep for pattern in code
+     │      ├── code-review ── read & reason about code
+     │      ├── spec-compare ─ compare code vs spec value
+     │      └── manual ─────── SKIP (flagged for human)
+     │      │
+     │      └── Each AC: PASS / FAIL / SKIP
+     │
+     ├── Pass 2: Invariant Regression Sweep
+     │      │
+     │      └── Every INV-* rule in INVARIANTS.md
+     │             │
+     │             └── PASS / REGRESSION
+     │
+     └── Verdict
+            │
+            ├── All pass ──→ CLEAR (proceed to review)
+            └── Any fail ──→ BLOCKED (fix, re-run)
+```
+
+### Invariants
+
+Machine-testable rules that must hold true after every task. They grow with the project.
+
+```
+INV-{category}-{yyyymmdd}-{slug}
+
+Categories:  S = Structural    B = Behavioral    D = Data
+Check types: code-grep | code-review | spec-compare | manual
+```
+
+New invariants are proposed during implementation, approved during review. Stale ones are pruned when intentional changes make them obsolete.
+
+## Adversarial Security Audit
+
+`/ddw:audit` is a separate review surface from `/ddw:qa`. QA checks spec-compliance (acceptance criteria + invariants). Audit checks attacker-resistance (OWASP Top 10 + STRIDE) using the `agents/security.md` profile (Opus). It is standalone — not hooked into `/ddw:review`, `/ddw:close`, or `/ddw:pr`, since most tasks have no security surface and auto-invocation would burn budget and train owners to ignore findings. Invoke it on demand: whole-codebase (`/ddw:audit`), per-task (`/ddw:audit TASK-id`), or per-path (`/ddw:audit <path>`). Reports land in `{workflowDir}/audits/`.
+
+## Drift Detection
+
+`/ddw:drift` compares CURRENT_SPEC against the codebase section-by-section:
+
+```
+  CURRENT_SPEC  ←──compare──→  Codebase
+       │                            │
+       ▼                            ▼
+  ┌──────────────────────────────────────┐
+  │  Contradiction: spec says X, code Y  │ ← must fix
+  │  Spec gap: code has it, spec doesn't │ ← acceptable (code ahead)
+  │  Code gap: spec says it, code doesn't│ ← must fix
+  └──────────────────────────────────────┘
+       │
+       ▼
+  SYNCED ── no contradictions, no code gaps
+  DRIFTED ─ any contradiction or code gap
+```
+
+Runs automatically at `/ddw:close`. If DRIFTED, you decide: fix the spec or fix the code.
+
+## Team Development
+
+DDW supports multiple developers working in parallel. Trunk-based: each task branch rebases onto base and merges (local) or opens a PR (team-PR mode). No long-lived integration branch.
+
+```
+  main branch ──────────────────────────────────────────────────────>
+       │                    │
+       │ /ddw:decision      │ /ddw:task
+       │ /ddw:task          │ (planning stays on main)
+       │                    │
+       ├── task/feat-a ─────┤──── Dev A: /ddw:sendit → qa → review → done
+       │                    │                                          │
+       │                    │                                  /ddw:close
+       │                    │                                  (rebase + merge,
+       │                    │                                   or /ddw:pr for PR)
+       │                    │                                          │
+       └── task/feat-b ─────┘──── Dev B: /ddw:sendit → qa → review → done ──→ ...
+```
+
+- **Identity**: `git config user.name` at runtime — no per-user config
+- **Planning on main**: Decisions and tasks on `main` so everyone sees them
+- **Implementation in worktrees**: `setup-worktree.sh TASK-id` creates `.worktrees/TASK-id/` on a fresh `task/TASK-id` branch
+- **Owner-aware hooks**: `require-active-task` checks *your* user — parallel work is fine
+- **Close on branch**: Local mode rebases + merges; team-PR mode opens a PR via `/ddw:pr`
+
+### Merge modes (local vs team-PR)
+
+DDW supports two merge modes via `merge.mode` in `ddw.json` (default `"local"`):
+
+- `"local"` — `/ddw:close` rebases the task branch, runs tests, merges to main locally. Fast for solo work; no PR overhead.
+- `"github-pr"` — `/ddw:pr` pushes the task branch, opens a GitHub PR via `gh`, and flips `Status: done → in_review`. After a reviewer merges the PR on GitHub, the owner runs `/ddw:close`, which verifies the remote merge, pulls the updated base, and archives the task. Requires the `gh` CLI authenticated to the repo.
+
+See [`templates/WORKFLOW.md` § Merge Modes](templates/WORKFLOW.md) for details, related config (`merge.baseBranch`, `merge.deleteBranchOnMerge`), and the team-PR-mode-only `in_review` status. Parallel-auto-mode safety (e.g. `touches_db: true` serialization) is also documented there.
+
+## Per-Task Worktree
+
+Each task implements in its own worktree on a fresh `task/TASK-id` branch. Parallel work has no file collisions. **The user-facing surface is slash commands** — the bash scripts are implementation details that skills invoke.
+
+### Configuration
+
+```json
+{
+  "worktree": {
+    "taskDir": ".worktrees/{TASK_NAME}",
+    "syncFiles": [".env"],
+    "maxConcurrent": 3
+  },
+  "commands": {
+    "install": "pnpm install",
+    "dev": "pnpm dev",
+    "migrate": null
+  },
+  "merge": {
+    "mode": "local"
+  }
+}
+```
+
+`syncFiles` are symlinked from the main repo into each new worktree (existing files are left alone). `commands.install` runs automatically when a worktree is missing `node_modules` / `.venv` / `vendor`. `commands.migrate` runs automatically when `/ddw:close` detects a migration file in the diff (configure `worktree.migrationGlob`).
+
+### Per-task flow (slash commands only)
+
+```
+/ddw:task                  ← author the task
+/ddw:sendit TASK-id        ← creates worktree, implements, runs review
+/ddw:close TASK-id         ← rebase + merge (local mode) or print push + PR
+                              instructions (pr mode); archives task; removes worktree
+```
+
+### Scripts (under the hood — invoked by skills)
+
+| Script | Invoked by |
+|---|---|
+| `setup-worktree.sh TASK-id [--base TASK-id]` | `/ddw:sendit` |
+| `ddw-index.mjs` | Owner runs manually or via pre-commit hook |
+
+You can still call any script directly from a shell — the skill layer is for ergonomics, not gatekeeping.
+
+### `.env.ddw` and port offsets
+
+`setup-worktree.sh` writes `PORT_OFFSET=<slot * 100>` to `.env.ddw` in the new worktree (slot = count of existing task worktrees + 1). `.env.ddw` is **never** in `syncFiles` — it's per-worktree by design. Source it from your `commands.dev`:
+
+```bash
+# pnpm dev wrapper, for example:
+set -a; source .env.ddw 2>/dev/null; set +a; pnpm dev
+```
+
+### Derived Logs (via `ddw-index`)
+
+4 log files — `TASK_LOG.md`, `DECISION_LOG.md`, `PRD_LOG.md`, `RETRO_LOG.md` — are **derived views**, regenerated from task/DEC/PRD source files by:
+
+```bash
+node ${CLAUDE_PLUGIN_DIR}/scripts/ddw-index.mjs --root .
+```
+
+Source files in `tasks/`, `decisions/`, `prds/` (including `archive/`) are the canonical truth. The script never mutates them. Modes:
+
+- **Default**: regenerate all 4 logs.
+- `--check`: exit 1 if any log is out of date (use as a pre-commit hook).
+- `--dry-run`: print row-level diff without writing.
+
+Run it after closing a task, or wire it into `pre-commit` so logs never drift.
+
+### Archive
+
+Completed tasks → `tasks/archive/`. Completed decisions → `decisions/archive/`. Completed PRDs → `prds/archive/`. Archived files stay in log sync. Active working set stays small.
+
+## Plugin Structure
+
+```
+ddw/
+├── .claude-plugin/
+│   └── plugin.json                Plugin manifest
+├── skills/                        16 skills (Claude Code slash commands)
+│   ├── init/SKILL.md              Bootstrap DDW into a project
+│   ├── ideate/SKILL.md            Shape ideas → PRD (Shaper agent)
+│   ├── decision/SKILL.md          Create decisions (Architect agent)
+│   ├── prd/SKILL.md               PRD lifecycle helpers (close)
+│   ├── task/SKILL.md              Create tasks with acceptance criteria
+│   ├── sendit/SKILL.md            Auto-worktree, implement, review (Developer agent)
+│   ├── qa/SKILL.md                Automated QA (QA agent)
+│   ├── audit/SKILL.md             Adversarial security audit — OWASP + STRIDE (Security agent, Opus)
+│   ├── review/SKILL.md            QA + owner checklist
+│   ├── pr/SKILL.md                Open a GitHub PR for a done task (team-PR mode only)
+│   ├── close/SKILL.md             Rebase + merge, spec, drift, retro, archive, worktree cleanup
+│   ├── sync-spec/SKILL.md         Update CURRENT_SPEC.md post-merge (auto-invoked from /ddw:close)
+│   ├── drift/SKILL.md             Spec-code consistency check
+│   ├── architect/SKILL.md         Design review / bootstrap
+│   ├── upgrade/SKILL.md           Upgrade project scaffolding
+│   └── auto/SKILL.md              Overnight orchestrator — autonomous pipeline loop
+├── scripts/                       Worktree + log-index runtime
+│   ├── ddw-index.mjs              Regenerate log views from source files
+│   ├── setup-worktree.sh          Create per-task git worktree
+│   └── _ddw_read_config.mjs       Internal config-reader helper
+├── hooks/
+│   ├── hooks.json                 Hook wiring (4 event types)
+│   └── scripts/                   Enforcement scripts (validate-datetime, etc.)
+├── agents/                        5 agent profiles (role mindsets)
+│   ├── shaper.md                  Thinking partner for ideation
+│   ├── architect.md               System designer
+│   ├── developer.md               Spec-first implementer
+│   ├── qa.md                      Adversarial evaluator
+│   └── security.md                Adversarial security reviewer (Opus)
+└── templates/                     Project scaffolding
+    ├── PRD_TEMPLATE.md
+    ├── TASK_TEMPLATE.md
+    ├── CURRENT_SPEC_TEMPLATE.md
+    ├── GUARDRAILS.md
+    ├── INVARIANTS.md
+    ├── WORKFLOW.md
+    ├── MILESTONES.md
+    ├── VOICE.md
+    └── ddw.json.example
+```
+
+## What `/ddw:init` Creates
+
+```
+{workflowDir}/
+├── ddw.json               Config (paths, commands.{install,dev,typecheck,test,lint,migrate}, worktree)
+├── prds/                  Product requirement documents
+│   └── archive/           Closed PRDs (moved here by /ddw:prd close)
+├── decisions/             Decision files (architect review + task list)
+│   └── archive/
+├── tasks/                 Task files (scoped work with acceptance criteria)
+│   └── archive/
+├── guardrails/
+│   ├── GUARDRAILS.md      Architecture rules (fill this in)
+│   └── INVARIANTS.md      Machine-testable rules (grows over time)
+├── logs/                  Derived views — regenerated by ddw-index, never hand-edited
+│   ├── TASK_LOG.md        Status table for all tasks
+│   ├── DECISION_LOG.md    Index of all decisions
+│   ├── PRD_LOG.md         Index of all PRDs
+│   └── RETRO_LOG.md       Retrospective entries per task
+├── hooks/                 Hook scripts (copied from plugin)
+├── agents/                Role profiles (copied from plugin)
+├── MILESTONES.md          Planning priority order
+├── WORKFLOW.md            Full workflow reference
+└── VOICE.md               Communication style
+```
+
+## Session Handoff
+
+When a session ends mid-task, the `## Session Handoff` section preserves context:
+
+- **Completed:** what's done
+- **Next:** specific next actions
+- **Blocked:** any blockers
+- **Key context:** non-obvious state ("tried X, failed because Y")
+
+`/ddw:sendit` detects handoff content on resume and displays a summary before continuing.
+
+## Learning Loop
+
+```
+  /ddw:close
+     │
+     └── Retrospective: "Anything surprising, difficult, or wrong?"
+            │
+            ├──→ GUARDRAILS.md     (new architecture rules)
+            ├──→ INVARIANTS.md     (new regression checks)
+            └──→ RETRO_LOG.md      (permanent record)
+```
+
+DDW gets smarter over time. Every task completion is a chance to tighten the harness.
+
+## Overnight Mode (`/ddw:auto`)
+
+The owner makes a few decisions, goes to bed. `/ddw:auto` walks the pipeline autonomously: implements `planned` tasks, runs QA, stages ready ones, smokes, closes. When it hits anything that needs an owner call, it logs to a morning inbox and moves to the next workable item. Never sits and waits.
+
+```
+  /ddw:auto [--budget tasks=N,minutes=M] [--level co-pilot|self-driving|advisor] [--dry-run]
+     │
+     ├── Pick next workable item by priority order:
+     │     1. done    → close (self-driving)
+     │     2. ready   → stage + smoke (self-driving)
+     │     3. r&b CLEAR → advance to done (self-driving)
+     │     4. impl-done → /ddw:qa
+     │     5. planned + capacity → /ddw:sendit
+     │     6. decided no-tasks → /ddw:task (self-driving)
+     │     7. proposed → skip → morning inbox
+     │
+     ├── Each implementation task → fresh subagent (own context)
+     ├── Up to auto.maxConcurrent sendit subagents in parallel
+     ├── QA / close / task creation: sequential (cheap, fast)
+     │
+     └── Exit on: budget hit, queue empty, 3 errors in a row,
+                  .ddw/STOP file, owner Ctrl-C
+```
+
+### Autonomy levels
+
+| Level | Runs | Stops at |
+|---|---|---|
+| `advisor` | Nothing — just plans | Always (one pass) |
+| `co-pilot` | rows 4–5 (qa, sendit) | Anything that closes or stages |
+| `self-driving` | rows 1–6 | Skip-and-log conditions only |
+
+### Skip-and-log conditions (never blocks the loop)
+
+- Task body contains destructive keywords (migrations, `rm`, `DROP`, secret rotation, …)
+- External API call without `dry_run` / `MOCK_EXTERNAL` / staging marker
+- Subagent reports `stopped-for-human`
+- QA blocks twice for the same task
+- Smoke red after one retry
+- Subagent timeout (`auto.subagentTimeoutMinutes`, default 20)
+
+### Smoke + browser checks
+
+```
+ddw.json
+└── smoke
+    ├── command: "pnpm smoke"        (exit 0 = pass)
+    ├── timeoutMinutes: 5
+    └── browser
+        ├── mode: "playwright-or-note"
+        └── checks:
+              - { url: "/health", expect: "status=200" }
+              - { url: "/login",  expect: "selector=#login-form" }
+```
+
+Browser check cascade:
+1. Playwright MCP available → drive Chrome, pass/fail is final.
+2. Else → `curl` for `status=*` checks; `selector=*` checks become "Check in Chrome" inbox notes.
+3. `mode: "note-only"` → skip 1 and 2 entirely.
+
+### Audit trail (every action recorded)
+
+```
+.ddw/logs/auto/<run-id>/
+  run.json         settings, counters, exit reason
+  tick.log         one line per loop iteration
+  inbox.md         the morning summary (also at .ddw/inbox/latest.md)
+  tasks/<id>.md    per-task subagent report (skill name, result, files changed)
+  smoke/<id>.json  smoke + browser check results
+```
+
+`<run-id>` = ISO timestamp of run start. Logs gitignored, kept locally indefinitely.
+
+### Morning inbox (the only file you have to read)
+
+```markdown
+# DDW Auto Run — 2026-05-09T22-00-00Z | self-driving | 8h12m
+
+## Shipped (12)            [tasks that closed / staged / advanced]
+## Check in Chrome (3)     [UI-only tasks — open URL, verify visually]
+## Decisions waiting on you (2)   [proposed DECs — your call]
+## Stuck (4)               [blocked: destructive op, QA failed twice, …]
+## Hard errors (0)         [subagent crashes, missing reports]
+```
+
+Each entry links to its detailed log. The inbox is the contract — drill down only when you want details.
+
+### Kill switch
+
+`touch .ddw/STOP` at the repo root → orchestrator finishes the current iteration and exits cleanly with `exit_reason: kill-switch`. Removing the file before the next run re-enables.
+
+## Caveats
+
+### What holds
+- Hard hooks (`exit 2`) cannot be bypassed through conversation
+- Even if Claude is persuaded to skip process, the write physically fails
+
+### What can be persuaded
+- `CLAUDE.md` instructions are soft — an LLM can be talked out of them
+- But hard hooks still block the actual write, limiting the damage
+
+### The real risk
+A user asking Claude to delete the hook scripts. Mitigations:
+- Hook scripts are git-tracked — `git checkout` restores them
+- Code review catches unauthorized hook removal in PRs
+
+### What's truly unbreakable
+**Git history.** Every decision, task, and change is a committed file. The absence of a decision file for a code change is visible in the log. The audit trail outlives the harness.
+
+## Philosophy
+
+DDW adds a thin layer of discipline to AI-assisted development:
+
+1. **Write down what you're deciding** before you decide it
+2. **Write down what you're building** before you build it
+3. **Verify it works** before you call it done
+4. **Record what changed** after it ships
+
+This prevents scope creep, ensures nothing is half-finished, and creates a searchable history of every decision and change in your project.
